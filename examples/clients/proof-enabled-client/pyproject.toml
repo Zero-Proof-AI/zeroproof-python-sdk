@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proof-enabled-client-example"
+version = "0.1.0"
+description = "Example demonstrating proof-enabled MCP client with redaction"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "httpx>=0.25.0",
+    # Local SDK dependencies would be installed separately
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[project.scripts]
+proof-client = "main:main"

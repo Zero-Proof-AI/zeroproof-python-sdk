@@ -115,6 +115,7 @@ class ClientSessionGroup:
     # Client-server connection management.
     _sessions: dict[mcp.ClientSession, _ComponentNames]
     _tool_to_session: dict[str, mcp.ClientSession]
+    _session_to_url: dict[mcp.ClientSession, str]  # Store server URLs
     _exit_stack: contextlib.AsyncExitStack
     _session_exit_stacks: dict[mcp.ClientSession, contextlib.AsyncExitStack]
 
@@ -137,6 +138,7 @@ class ClientSessionGroup:
 
         self._sessions = {}
         self._tool_to_session = {}
+        self._session_to_url = {}  # Initialize server URL mapping
         if exit_stack is None:
             self._exit_stack = contextlib.AsyncExitStack()
             self._owns_exit_stack = True
@@ -209,6 +211,35 @@ class ClientSessionGroup:
             meta=meta,
         )
 
+    async def call_tool_with_proof(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        zkfetch_wrapper_url: str | None = None,
+        attestation_config: Any | None = None,  # AttestationConfig
+        tool_options_map: Any | None = None,  # ToolOptionsMap
+        read_timeout_seconds: float | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: types.RequestParamsMeta | None = None,
+    ) -> tuple[types.CallToolResult, Any | None]:  # Tuple[CallToolResult, Optional[CryptographicProof]]
+        """Executes a tool with optional cryptographic proof collection."""
+        session = self._tool_to_session[name]
+        session_tool_name = self.tools[name].name
+        server_url = self._session_to_url.get(session)
+        
+        return await session.call_tool_with_proof(
+            session_tool_name,
+            arguments=arguments,
+            server_url=server_url,
+            zkfetch_wrapper_url=zkfetch_wrapper_url,
+            attestation_config=attestation_config,
+            tool_options_map=tool_options_map,
+            read_timeout_seconds=read_timeout_seconds,
+            progress_callback=progress_callback,
+            meta=meta,
+        )
+
     async def disconnect_from_server(self, session: mcp.ClientSession) -> None:
         """Disconnects from a single MCP server."""
 
@@ -258,7 +289,13 @@ class ClientSessionGroup:
     ) -> mcp.ClientSession:
         """Connects to a single MCP server."""
         server_info, session = await self._establish_session(server_params, session_params or ClientSessionParameters())
-        return await self.connect_with_session(server_info, session)
+        session = await self.connect_with_session(server_info, session)
+        
+        # Store the server URL for proof collection
+        if isinstance(server_params, (SseServerParameters, StreamableHttpParameters)):
+            self._session_to_url[session] = server_params.url
+        
+        return session
 
     async def _establish_session(
         self,

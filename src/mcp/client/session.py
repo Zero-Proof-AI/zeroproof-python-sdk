@@ -10,6 +10,8 @@ from mcp.client.experimental import ExperimentalClientFeatures
 from mcp.client.experimental.task_handlers import ExperimentalTaskHandlers
 from mcp.shared.context import RequestContext
 from mcp.shared.message import SessionMessage
+from mcp.shared.proxy_fetch import ProxyConfig, ProxyFetch
+from mcp.shared.proof import CryptographicProof
 from mcp.shared.session import BaseSession, ProgressFnT, RequestResponder
 from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 from mcp.types._types import RequestParamsMeta
@@ -321,6 +323,105 @@ class ClientSession(
             await self._validate_tool_result(name, result)
 
         return result
+
+    async def call_tool_with_proof(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        server_url: str | None = None,
+        zkfetch_wrapper_url: str | None = None,
+        attestation_config: Any | None = None,  # AttestationConfig
+        tool_options_map: Any | None = None,  # ToolOptionsMap
+        read_timeout_seconds: float | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: RequestParamsMeta | None = None,
+    ) -> tuple[types.CallToolResult, Any | None]:  # Tuple[CallToolResult, Optional[CryptographicProof]]
+        """Send a tools/call request with optional cryptographic proof collection.
+
+        If zkfetch_wrapper_url is provided, uses ProxyFetch for proof-enabled calls.
+        Otherwise, falls back to standard MCP call_tool.
+        """
+        if zkfetch_wrapper_url and server_url:
+            # Use ProxyFetch for proof collection
+            try:
+
+                print(f"[TOOL] Calling {name} via zkfetch-wrapper (PROXIED)")
+
+                proxy_config = ProxyConfig(
+                    url=zkfetch_wrapper_url,
+                    proxy_type="zkfetch",
+                    username=None,
+                    password=None,
+                    tool_options_map=tool_options_map,
+                    default_zk_options=None,
+                    debug=False,
+                    attestation_config=attestation_config,
+                )
+
+                proxy_fetch = ProxyFetch(proxy_config)
+                target_url = f"{server_url}/tools/{name}"
+
+                # Add tool name to arguments
+                args_with_name = (arguments or {}).copy()
+                args_with_name["name"] = name
+
+                response = await proxy_fetch.post(target_url, args_with_name)
+
+                # Extract proof and result
+                proof = response.get("onchainProof") or response.get("proof")
+                verified = response.get("verified", False)
+                onchain_compatible = "onchainProof" in response or response.get("metadata", {}).get("onchain_compatible", False)
+
+                tool_result = response.get("data", {})
+
+                # Create CryptographicProof if proof exists
+                crypto_proof = None
+                if proof:
+                    import time
+
+                    crypto_proof = CryptographicProof(
+                        tool_name=name,
+                        timestamp=int(time.time()),
+                        request=arguments or {},
+                        response=tool_result,
+                        proof=proof,
+                        proof_id=response.get("metadata", {}).get("proof_id"),
+                        verified=verified,
+                        onchain_compatible=onchain_compatible,
+                        display_response=tool_result,
+                        redaction_metadata=None,
+                    )
+
+                # Convert to CallToolResult format
+                content = []
+                if "data" in tool_result:
+                    content.append(types.TextContent(
+                        type="text",
+                        text=str(tool_result["data"])
+                    ))
+
+                result = types.CallToolResult(
+                    content=content,
+                    is_error=False,
+                )
+
+                print(f"[PROOF] ✓ Proof collected for {name} - Verified: {verified}, On-chain: {onchain_compatible}")
+                return result, crypto_proof
+
+            except ImportError:
+                logger.warning("ProxyFetch not available, falling back to standard call")
+                # Fall back to standard call
+
+        # Standard MCP call
+        result = await self.call_tool(
+            name=name,
+            arguments=arguments,
+            read_timeout_seconds=read_timeout_seconds,
+            progress_callback=progress_callback,
+            meta=meta,
+        )
+        return result, None
 
     async def _validate_tool_result(self, name: str, result: types.CallToolResult) -> None:
         """Validate the structured content of a tool result against its output schema."""

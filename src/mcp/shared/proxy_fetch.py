@@ -32,11 +32,6 @@ class ZkfetchToolOptions:
     # Example: `{"jsonPath": "$.data.card_number"}` to hide the card_number field
     redactions: Optional[List[Dict[str, Any]]] = None
 
-    # Sensitive field paths in the response that should be redacted
-    # Maps field names to their jsonPath in the response structure
-    # Example: `{"passenger_name": "$.data.passenger_name"}`
-    response_redaction_paths: Optional[Dict[str, str]] = None
-
 
 @dataclass
 class RedactionRule:
@@ -242,8 +237,17 @@ class ProxyFetch:
             if isinstance(hidden_params, list):
                 # Extract from request body
                 if isinstance(final_body, dict):
+                    # Try to extract from nested MCP structure (params.arguments)
+                    arguments = final_body.get("params", {}).get("arguments", {})
+                    if arguments:
+                        for param in hidden_params:
+                            if isinstance(param, str) and param in arguments:
+                                param_values_map[param] = arguments[param]
+                                arguments[param] = f"{{{param}}}"
+                    
+                    # Also try top-level body for direct tool parameters
                     for param in hidden_params:
-                        if isinstance(param, str) and param in final_body:
+                        if isinstance(param, str) and param in final_body and param not in param_values_map:
                             param_values_map[param] = final_body[param]
                             final_body[param] = f"{{{param}}}"
 
@@ -267,10 +271,11 @@ class ProxyFetch:
                     if url_modified:
                         final_url = f"{base_url}?{'&'.join(new_query_parts)}"
 
-                if param_values_map:
-                    private_options["paramValues"] = param_values_map
-                    private_options.pop("hideRequestBody", None)
-                    private_options.pop("hiddenParameters", None)
+                # Always insert paramValues and clean up temporary fields when hiddenParameters is present
+                # Even if param_values_map is empty, we need to ensure zkfetch-wrapper gets the right structure
+                private_options["paramValues"] = param_values_map
+                private_options.pop("hideRequestBody", None)
+                private_options.pop("hiddenParameters", None)
 
         # Build zkfetch payload
         zkfetch_payload = {

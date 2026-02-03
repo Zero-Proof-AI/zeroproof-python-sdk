@@ -341,6 +341,10 @@ class ClientSession(
 
         If zkfetch_wrapper_url is provided, uses ProxyFetch for proof-enabled calls.
         Otherwise, falls back to standard MCP call_tool.
+        
+        Supports both:
+        - REST endpoints: {server_url}/tools/{name}
+        - MCP endpoints: {server_url} with JSON-RPC tools/call
         """
         if zkfetch_wrapper_url and server_url:
             # Use ProxyFetch for proof collection
@@ -360,20 +364,84 @@ class ClientSession(
                 )
 
                 proxy_fetch = ProxyFetch(proxy_config)
-                target_url = f"{server_url}/tools/{name}"
+                
+                # Detect if this is an MCP endpoint (ends with /mcp) or REST endpoint
+                is_mcp_endpoint = server_url.endswith("/mcp")
+                
+                if is_mcp_endpoint:
+                    # For MCP endpoints, construct a JSON-RPC request body
+                    target_url = server_url
+                    request_body = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": name,
+                            "arguments": arguments or {}
+                        }
+                    }
+                else:
+                    # For REST endpoints, construct REST URL
+                    target_url = f"{server_url}/tools/{name}"
+                    request_body = arguments or {}
 
-                # Add tool name to arguments
-                args_with_name = (arguments or {}).copy()
-                args_with_name["name"] = name
-
-                response = await proxy_fetch.post(target_url, args_with_name)
+                # Make the request via ProxyFetch
+                if is_mcp_endpoint:
+                    response = await proxy_fetch.post(target_url, request_body)
+                else:
+                    args_with_name = (arguments or {}).copy()
+                    args_with_name["name"] = name
+                    response = await proxy_fetch.post(target_url, args_with_name)
 
                 # Extract proof and result
                 proof = response.get("onchainProof") or response.get("proof")
                 verified = response.get("verified", False)
                 onchain_compatible = "onchainProof" in response or response.get("metadata", {}).get("onchain_compatible", False)
 
-                tool_result = response.get("data", {})
+                # Parse result based on endpoint type
+                if is_mcp_endpoint:
+                    # MCP response via zkfetch has structure: { data: { result: { content: [...] } }, proof: ..., ... }
+                    # Extract the actual MCP response which is wrapped in 'data' by zkfetch
+                    zkfetch_data = response.get("data", {})
+                    
+                    if isinstance(zkfetch_data, dict):
+                        mcp_result = zkfetch_data.get("result", {})
+                    else:
+                        # zkfetch_data might be a string
+                        try:
+                            import json as json_module
+                            zkfetch_data = json_module.loads(zkfetch_data) if isinstance(zkfetch_data, str) else zkfetch_data
+                            mcp_result = zkfetch_data.get("result", {})
+                        except:
+                            mcp_result = zkfetch_data
+                    
+                    # Extract content from MCP result
+                    if isinstance(mcp_result, dict) and "content" in mcp_result:
+                        content_list = mcp_result["content"]
+                        if content_list and isinstance(content_list, list):
+                            first_content = content_list[0]
+                            if isinstance(first_content, dict) and "text" in first_content:
+                                tool_result = first_content["text"]
+                            else:
+                                tool_result = str(first_content)
+                        else:
+                            tool_result = str(content_list)
+                    else:
+                        tool_result = mcp_result
+                    
+                    # If tool_result is a JSON string, try to extract the embedded proof
+                    if isinstance(tool_result, str) and tool_result.strip().startswith('{'):
+                        try:
+                            import json as json_module
+                            tool_result_dict = json_module.loads(tool_result)
+                            if isinstance(tool_result_dict, dict) and "proof" in tool_result_dict:
+                                # Use the embedded proof from the tool result (this is the full Reclaim proof)
+                                proof = tool_result_dict["proof"]
+                        except:
+                            pass
+                else:
+                    # REST response has data field
+                    tool_result = response.get("data", {})
 
                 # Create CryptographicProof if proof exists
                 crypto_proof = None
@@ -395,10 +463,15 @@ class ClientSession(
 
                 # Convert to CallToolResult format
                 content = []
-                if "data" in tool_result:
+                if isinstance(tool_result, dict) and "data" in tool_result:
                     content.append(types.TextContent(
                         type="text",
                         text=str(tool_result["data"])
+                    ))
+                elif tool_result:
+                    content.append(types.TextContent(
+                        type="text",
+                        text=str(tool_result)
                     ))
 
                 result = types.CallToolResult(
